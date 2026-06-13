@@ -1,42 +1,15 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from sqlalchemy import text
+import os
+import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-
-from database import engine
+from pydantic import BaseModel
+from typing import Dict
 
 app = FastAPI()
 
-
-@app.get("/db-check")
-def check_database():
-    try:
-        from database import engine
-        from sqlalchemy import text
-        with engine.connect() as connection:
-            # 1. Test basic connection
-            connection.execute(text("SELECT 1"))
-            
-            # 2. Check if the users table actually exists
-            result = connection.execute(text(
-                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')"
-            )).scalar()
-            
-            table_status = "Exists! 🎉" if result else "Missing! ❌ (We need to create it)"
-            
-            return {
-                "database_connected": True,
-                "users_table": table_status
-            }
-    except Exception as e:
-        return {
-            "database_connected": False,
-            "error": str(e)
-        }
-
-
-
-
+# Enable CORS so your local HTML file can connect smoothly
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,100 +18,105 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class LoginRequest(BaseModel):
-    email: str
-    password: str
+# 1. Database Connection Setup
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:RhHhQnCivrwsCZAEDtXDibvxhNGWPipK@kodama.proxy.rlwy.net:48226/railway")
 
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-@app.post("/login")
-def login(data: LoginRequest):
+# Create the messages table automatically if it doesn't exist
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY,
+            sender_id INT NOT NULL,
+            receiver_id INT NOT NULL,
+            message_text TEXT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    with engine.connect() as conn:
+init_db()
 
-        result = conn.execute(
-            text(
-                """
-                SELECT *
-                FROM users
-                WHERE email = :email
-                """
-            ),
-            {
-                "email": data.email
-            }
-        )
+# 2. Live Connection Manager Matrix
+class ConnectionManager:
+    def __init__(self):
+        # Maps user_id to their active live WebSocket connection
+        self.active_connections: Dict[int, WebSocket] = {}
 
-        user = result.fetchone()
+    async def connect(self, user_id: int, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[user_id] = websocket
 
-        if user is None:
-            return {
-                "success": False,
-                "message": "User not found"
-            }
+    def disconnect(self, user_id: int):
+        if user_id in self.active_connections:
+            del self.active_connections[user_id]
 
-        user = dict(user._mapping)
+    async def send_private_message(self, message: str, receiver_id: int):
+        if receiver_id in self.active_connections:
+            await self.active_connections[receiver_id].send_text(message)
 
-        if user["password"] != data.password:
-            return {
-                "success": False,
-                "message": "Wrong password"
-            }
+manager = ConnectionManager()
 
-        return {
-            "success": True,
-            "name": user["name"]
-        }
-    
-@app.get("/user/{email}")
-def get_user(email: str):
+# 3. HTTP Route: Check DB Status
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "WhatsApp Backend is fully functional! 🚀"}
 
-    with engine.connect() as conn:
+# 4. HTTP Route: Fetch Historical Chat Logs
+@app.get("/history/{user_a}/{user_b}")
+def get_chat_history(user_a: int, user_b: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Pulls all previous conversations between these two users in order
+    cur.execute("""
+        SELECT sender_id, receiver_id, message_text, timestamp 
+        FROM messages 
+        WHERE (sender_id = %s AND receiver_id = %s) 
+           OR (sender_id = %s AND receiver_id = %s)
+        ORDER BY timestamp ASC;
+    """, (user_a, user_b, user_b, user_a))
+    history = cur.fetchall()
+    cur.close()
+    conn.close()
+    return history
 
-        result = conn.execute(
-            text("""
-                SELECT *
-                FROM users
-                WHERE email = :email
-            """),
-            {"email": email}
-        )
+# 5. WebSocket Route: Real-Time Live Traffic
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: int):
+    user_id = int(user_id)
+    await manager.connect(user_id, websocket)
+    try:
+        while True:
+            # Wait for incoming payload string from user's screen
+            data = await websocket.receive_text()
+            payload = json.loads(data)
+            
+            receiver_id = int(payload["receiver_id"])
+            message_text = payload["message"]
 
-        user = result.fetchone()
+            # Save the message right into Postgres
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO messages (sender_id, receiver_id, message_text) 
+                VALUES (%s, %s, %s);
+            """, (user_id, receiver_id, message_text))
+            conn.commit()
+            cur.close()
+            conn.close()
 
-        if not user:
-            return {"error": "User not found"}
+            # Instantly forward message to the receiver if they are online
+            outgoing_payload = json.dumps({
+                "sender_id": user_id,
+                "message": message_text
+            })
+            await manager.send_private_message(outgoing_payload, receiver_id)
 
-        return dict(user._mapping)
-    
-class SignupRequest(BaseModel):
-    name: str
-    age: int
-    email: str
-    password: str
-
-@app.post("/signup")
-def signup(data: SignupRequest):
-
-    with engine.connect() as conn:
-
-        conn.execute(
-            text("""
-                INSERT INTO users
-                (name, age, email, password)
-                VALUES
-                (:name, :age, :email, :password)
-            """),
-            {
-                "name": data.name,
-                "age": data.age,
-                "email": data.email,
-                "password": data.password
-            }
-        )
-
-        conn.commit()
-
-    return {
-        "success": True,
-        "message": "Account Created Successfully"
-    }
+    except WebSocketDisconnect:
+        manager.disconnect(user_id)

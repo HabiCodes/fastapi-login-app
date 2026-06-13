@@ -6,6 +6,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import engine
 
 app = FastAPI()
+
+
+@app.get("/db-check")
+def check_database():
+    try:
+        from database import engine
+        from sqlalchemy import text
+        with engine.connect() as connection:
+            # 1. Test basic connection
+            connection.execute(text("SELECT 1"))
+            
+            # 2. Check if the users table actually exists
+            result = connection.execute(text(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')"
+            )).scalar()
+            
+            table_status = "Exists! 🎉" if result else "Missing! ❌ (We need to create it)"
+            
+            return {
+                "database_connected": True,
+                "users_table": table_status
+            }
+    except Exception as e:
+        return {
+            "database_connected": False,
+            "error": str(e)
+        }
+
+
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
